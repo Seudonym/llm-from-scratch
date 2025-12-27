@@ -32,14 +32,15 @@ class PositionalEncoding(nn.Module):
         encoding = position * div_term  # (max_len, d_model // 2)
 
         # dim1 here is batch_size. setting it to 1 so that broadcasting works with batches
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(encoding)
-        pe[:, 0, 1::2] = torch.cos(encoding)
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(encoding)
+        pe[:, 1::2] = torch.cos(encoding)
+        pe = pe.unsqueeze(0)
 
         self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[: x.shape[0]]
+        x = x + self.pe[:, : x.shape[1], :]
         return x
 
 
@@ -75,42 +76,43 @@ class MultiHeadAttention(nn.Module):
         q: torch.Tensor,  # (batch_size, seq_len, d_model)
         k: torch.Tensor,  # same as above
         v: torch.Tensor,  # same as above
-        mask: torch.Tensor | None,  # (batch_size, seq_len, seq_len)
+        mask: torch.Tensor | None,  # (batch_size, seq_len_q, seq_len_kv)
     ) -> torch.Tensor:
-        query = self.w_q(q)  # (batch_size, seq_len, d_model)
-        key = self.w_k(k)  # same as above
-        value = self.w_v(v)  # same as above
+        query = self.w_q(q)  # (batch_size, seq_len_q, d_model)
+        key = self.w_k(k)  # (batch_size, seq_len_kv, d_model)
+        value = self.w_v(v)  # (batch_size, seq_len_kv, d_model)
 
-        batch_size, seq_len, _ = q.shape
+        batch_size, seq_len_q, _ = q.shape
+        seq_len_kv = k.shape[1]
         # split into h pieces
         # we have to do (batch_size, seq_len, d_model) --> (batch_size, h, seq_len, d_k)
         # first         (batch_size, seq_len, d_model) --> (batch_size, seq_len, h, d_k)
         # then          (batch_size, seq_len, h, d_k).transpose(1, 2) --> (batch_size, h, seq_len, d_k)
-        query = query.view(batch_size, seq_len, self.h, self.d_k).transpose(
+        query = query.view(batch_size, seq_len_q, self.h, self.d_k).transpose(
             1, 2
-        )  # (batch_size, h, seq_len, d_k)
-        key = key.view(batch_size, seq_len, self.h, self.d_k).transpose(
+        )  # (batch_size, h, seq_len_q, d_k)
+        key = key.view(batch_size, seq_len_kv, self.h, self.d_k).transpose(
             1, 2
-        )  # (batch_size, h, seq_len, d_k)
-        value = value.view(batch_size, seq_len, self.h, self.d_k).transpose(
+        )  # (batch_size, h, seq_len_kv, d_k)
+        value = value.view(batch_size, seq_len_kv, self.h, self.d_k).transpose(
             1, 2
-        )  # (batch_size, h, seq_len, d_k)
+        )  # (batch_size, h, seq_len_kv, d_k)
 
         attention_scores = (
             query @ key.transpose(-1, -2)
-        ) / self.sqrt_d_k  # (batch_size, h, seq_len, seq_len)
+        ) / self.sqrt_d_k  # (batch_size, h, seq_len_q, seq_len_kv)
 
         if mask is not None:
-            attention_scores.masked_fill(mask == 0, 1e-9)
+            attention_scores = attention_scores.masked_fill(mask == 0, float("-inf"))
 
         attention_scores = torch.softmax(
             attention_scores, dim=-1
-        )  # (batch_size, h, seq_len, seq_len)
+        )  # (batch_size, h, seq_len_q, seq_len_kv)
 
-        attention = attention_scores @ value  # (batch_size, h, seq_len, d_k)
+        attention = attention_scores @ value  # (batch_size, h, seq_len_q, d_k)
         attention = (
-            attention.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        )  # (batch_size, seq_len, d_model)
+            attention.transpose(1, 2).contiguous().view(batch_size, seq_len_q, -1)
+        )  # (batch_size, seq_len_q, d_model)
 
         return self.w_o(attention)  # (batch_size, seq_len, d_model)
 
@@ -252,6 +254,7 @@ class TransformerConfig:
 
 class Transformer(nn.Module):
     def __init__(self, cfg: TransformerConfig) -> None:
+        super().__init__()
 
         self.input_scaled_emb = ScaledEmbedding(cfg.d_model, cfg.vocab_size_src)
         self.output_scaled_emb = ScaledEmbedding(cfg.d_model, cfg.vocab_size_tgt)
@@ -283,7 +286,7 @@ class Transformer(nn.Module):
 
     def encode(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         x = self.input_scaled_emb(x)  # (batch_size, seq_len, d_model)
-        x = x + self.input_pos_enc(x)  # (batch_size, seq_len, d_model)
+        x = self.input_pos_enc(x)  # (batch_size, seq_len, d_model)
         x = self.input_emb_dropout(x)
         x = self.encoder(x, mask)  # (batch_size, seq_len, d_model)
         return x
@@ -292,11 +295,11 @@ class Transformer(nn.Module):
         self,
         x: torch.Tensor,
         encoder_output: torch.Tensor,
-        src_mask: torch.Tensor,
-        tgt_mask: torch.Tensor,
+        src_mask: torch.Tensor | None,
+        tgt_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         x = self.output_scaled_emb(x)  # (batch_size, seq_len, d_model)
-        x = x + self.output_pos_enc(x)  # (batch_size, seq_len, d_model)
+        x = self.output_pos_enc(x)  # (batch_size, seq_len, d_model)
         x = self.output_emb_dropout(x)
         x = self.decoder(
             x, encoder_output, src_mask, tgt_mask
